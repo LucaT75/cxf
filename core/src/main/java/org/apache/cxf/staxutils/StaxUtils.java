@@ -35,7 +35,9 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
+import java.util.WeakHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -125,10 +127,10 @@ public final class StaxUtils {
 
     private static final Logger LOG = LogUtils.getL7dLogger(StaxUtils.class);
 
-    private static final Queue<XMLInputFactory> NS_AWARE_INPUT_FACTORY_POOL;
-    private static final XMLInputFactory SAFE_INPUT_FACTORY;
-    private static final Queue<XMLOutputFactory> OUTPUT_FACTORY_POOL;
-    private static final XMLOutputFactory SAFE_OUTPUT_FACTORY;
+    private static final Map<ClassLoader, Queue<XMLInputFactory>> NS_AWARE_INPUT_FACTORY_POOL
+        = Collections.synchronizedMap(new WeakHashMap<ClassLoader, Queue<XMLInputFactory>>());
+    private static final Map<ClassLoader, Queue<XMLOutputFactory>> OUTPUT_FACTORY_POOL
+        = Collections.synchronizedMap(new WeakHashMap<ClassLoader, Queue<XMLOutputFactory>>());
 
     private static final String XML_NS = "http://www.w3.org/2000/xmlns/";
     private static final String[] DEF_PREFIXES = new String[] {
@@ -137,68 +139,35 @@ public final class StaxUtils {
         "ns7".intern(), "ns8".intern(), "ns9".intern()
     };
 
-    private static int innerElementLevelThreshold = 100;
-    private static int innerElementCountThreshold = 50000;
-    private static int maxAttributeCount = 500;
-    private static int maxAttributeSize = 64 * 1024; //64K per attribute, likely just "list" will hit
-    private static int maxTextLength = 128 * 1024 * 1024;  //128M - more than this should DEFINITLEY use MTOM
-    private static int minTextSegment = 64; // Same default as woodstox
-    private static long maxElementCount = Long.MAX_VALUE;
-    private static long maxXMLCharacters = Long.MAX_VALUE;
+    private static final int MAX_ATTR_COUNT_VAL =
+        getInteger(MAX_ATTRIBUTE_COUNT, 500);
+    private static final int MAX_ATTR_SIZE_VAL =
+        getInteger(MAX_ATTRIBUTE_SIZE, 64 * 1024); //64K per attribute, likely just "list" will hit
+    private static final int MAX_TEXT_LENGTH_VAL =
+        getInteger(MAX_TEXT_LENGTH, 128 * 1024 * 1024);  //128M - more than this should DEFINITELY use MTOM
+    private static final int MIN_TEXT_SEGMENT_VAL =
+        getInteger(MIN_TEXT_SEGMENT, 64); // Same default as woodstox
+    private static final long MAX_ELEMENT_COUNT_VAL =
+        getLong(MAX_ELEMENT_COUNT, Long.MAX_VALUE);
+    private static final long MAX_XML_CHARS_VAL =
+        getLong(MAX_XML_CHARACTERS, Long.MAX_VALUE);
+    private static final int PARSER_POOL_SIZE_VAL =
+        getInteger("org.apache.cxf.staxutils.pool-size", 20);
 
-    private static boolean allowInsecureParser;
+    // Here we check old names first and then new names for the threshold properties
+    private static final int MAX_ELEMENT_DEPTH_VAL =
+        getInteger(MAX_ELEMENT_DEPTH, getInteger(INNER_ELEMENT_LEVEL_SYSTEM_PROP, 100));
+    private static final int MAX_CHILD_ELEMENTS_VAL =
+        getInteger(MAX_CHILD_ELEMENTS, getInteger(INNER_ELEMENT_COUNT_SYSTEM_PROP, 50000));
+    private static final boolean ALLOW_INSECURE_PARSER_VAL;
 
     static {
-        int i = getInteger("org.apache.cxf.staxutils.pool-size", 20);
-
-        NS_AWARE_INPUT_FACTORY_POOL = new ArrayBlockingQueue<>(i);
-        OUTPUT_FACTORY_POOL = new ArrayBlockingQueue<>(i);
-
-        //old names
-        innerElementCountThreshold = getInteger(INNER_ELEMENT_COUNT_SYSTEM_PROP, innerElementCountThreshold);
-        innerElementLevelThreshold = getInteger(INNER_ELEMENT_LEVEL_SYSTEM_PROP, innerElementLevelThreshold);
-        //new names
-        innerElementCountThreshold = getInteger(MAX_CHILD_ELEMENTS, innerElementCountThreshold);
-        innerElementLevelThreshold = getInteger(MAX_ELEMENT_DEPTH, innerElementLevelThreshold);
-        maxAttributeCount = getInteger(MAX_ATTRIBUTE_COUNT, maxAttributeCount);
-        maxAttributeSize = getInteger(MAX_ATTRIBUTE_SIZE, maxAttributeSize);
-        maxTextLength = getInteger(MAX_TEXT_LENGTH, maxTextLength);
-        minTextSegment = getInteger(MIN_TEXT_SEGMENT, minTextSegment);
-        maxElementCount = getLong(MAX_ELEMENT_COUNT, maxElementCount);
-        maxXMLCharacters = getLong(MAX_XML_CHARACTERS, maxXMLCharacters);
-
         String s = SystemPropertyAction.getPropertyOrNull(ALLOW_INSECURE_PARSER);
         if (!StringUtils.isEmpty(s)) {
-            allowInsecureParser = "1".equals(s) || Boolean.parseBoolean(s);
+            ALLOW_INSECURE_PARSER_VAL = "1".equals(s) || Boolean.parseBoolean(s);
+        } else {
+            ALLOW_INSECURE_PARSER_VAL = false;
         }
-
-        XMLInputFactory xif = null;
-        try {
-            xif = createXMLInputFactory(true);
-            String xifClassName = xif.getClass().getName();
-            if (!xifClassName.contains("ctc.wstx") && !xifClassName.contains("xml.xlxp")
-                    && !xifClassName.contains("xml.xlxp2") && !xifClassName.contains("bea.core")) {
-                xif = null;
-            }
-        } catch (Throwable t) {
-            //ignore, can always drop down to the pooled factories
-            xif = null;
-        }
-        SAFE_INPUT_FACTORY = xif;
-
-        XMLOutputFactory xof = null;
-        try {
-            xof = XMLOutputFactory.newInstance();
-            String xofClassName = xof.getClass().getName();
-            if (!xofClassName.contains("ctc.wstx") && !xofClassName.contains("xml.xlxp")
-                && !xofClassName.contains("xml.xlxp2") && !xofClassName.contains("bea.core")) {
-                xof = null;
-            }
-        } catch (Throwable t) {
-            //ignore, can always drop down to the pooled factories
-        }
-        SAFE_OUTPUT_FACTORY = xof;
-
     }
 
     private StaxUtils() {
@@ -236,13 +205,20 @@ public final class StaxUtils {
         return def;
     }
 
+    /**
+     * @deprecated Calling this method has no effect. Use the system property instead to set this threshold
+     */
+    @Deprecated
     public static void setInnerElementLevelThreshold(int i) {
-        innerElementLevelThreshold = i != -1 ? i : 500;
-        setProperty(SAFE_INPUT_FACTORY, "com.ctc.wstx.maxElementDepth", innerElementLevelThreshold);
+        // complete
     }
+
+    /**
+     * @deprecated Calling this method has no effect. Use the system property instead to set this threshold
+     */
+    @Deprecated
     public static void setInnerElementCountThreshold(int i) {
-        innerElementCountThreshold = i != -1 ? i : 50000;
-        setProperty(SAFE_INPUT_FACTORY, "com.ctc.wstx.maxChildrenPerElement", innerElementCountThreshold);
+        // complete
     }
 
     /**
@@ -264,37 +240,66 @@ public final class StaxUtils {
     /**
      * Return a cached, namespace-aware, factory.
      */
-    private static XMLInputFactory getXMLInputFactory() {
-        if (SAFE_INPUT_FACTORY != null) {
-            return SAFE_INPUT_FACTORY;
+    private static XMLInputFactory getXMLInputFactory(ClassLoader loader) {
+
+        if (loader == null) {
+            return createXMLInputFactory(true);
         }
-        XMLInputFactory f = NS_AWARE_INPUT_FACTORY_POOL.poll();
-        if (f == null) {
-            f = createXMLInputFactory(true);
+
+        Queue<XMLInputFactory> queue = NS_AWARE_INPUT_FACTORY_POOL.get(loader);
+        if (queue == null) {
+            queue = new ArrayBlockingQueue<>(PARSER_POOL_SIZE_VAL);
+            NS_AWARE_INPUT_FACTORY_POOL.put(loader, queue);
         }
-        return f;
+
+        XMLInputFactory factory = queue.poll();
+        if (factory == null) {
+            factory = createXMLInputFactory(true);
+        }
+        return factory;
     }
 
-    private static void returnXMLInputFactory(XMLInputFactory factory) {
-        if (SAFE_INPUT_FACTORY != factory) {
-            NS_AWARE_INPUT_FACTORY_POOL.offer(factory);
+    private static void returnXMLInputFactory(XMLInputFactory factory, ClassLoader loader) {
+        if (loader != null) {
+            Queue<XMLInputFactory> queue = NS_AWARE_INPUT_FACTORY_POOL.get(loader);
+            if (queue != null) {
+                queue.offer(factory);
+            }
         }
     }
 
     private static XMLOutputFactory getXMLOutputFactory() {
-        if (SAFE_OUTPUT_FACTORY != null) {
-            return SAFE_OUTPUT_FACTORY;
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
         }
-        XMLOutputFactory f = OUTPUT_FACTORY_POOL.poll();
-        if (f == null) {
-            f = XMLOutputFactory.newInstance();
+        if (loader == null) {
+            return XMLOutputFactory.newInstance();
         }
-        return f;
+
+        Queue<XMLOutputFactory> queue = OUTPUT_FACTORY_POOL.get(loader);
+        if (queue == null) {
+            queue = new ArrayBlockingQueue<>(PARSER_POOL_SIZE_VAL);
+            OUTPUT_FACTORY_POOL.put(loader, queue);
+        }
+
+        XMLOutputFactory factory = queue.poll();
+        if (factory == null) {
+            factory = XMLOutputFactory.newInstance();
+        }
+        return factory;
     }
 
     private static void returnXMLOutputFactory(XMLOutputFactory factory) {
-        if (SAFE_OUTPUT_FACTORY != factory) {
-            OUTPUT_FACTORY_POOL.offer(factory);
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+        if (loader != null) {
+            Queue<XMLOutputFactory> queue = OUTPUT_FACTORY_POOL.get(loader);
+            if (queue != null) {
+                queue.offer(factory);
+            }
         }
     }
 
@@ -327,7 +332,7 @@ public final class StaxUtils {
             }
 
             if (!setRestrictionProperties(factory)) {
-                if (allowInsecureParser) {
+                if (ALLOW_INSECURE_PARSER_VAL) {
                     LOG.log(Level.WARNING, "INSECURE_PARSER_DETECTED", factory.getClass().getName());
                 } else {
                     throw new RuntimeException("Cannot create a secure XMLInputFactory, "
@@ -362,15 +367,15 @@ public final class StaxUtils {
     private static boolean setRestrictionProperties(XMLInputFactory factory) {
         //For now, we can only support Woodstox 4.2.x and newer as none of the other
         //stax parsers support these settings
-        final boolean wstxMaxs = setProperty(factory, "com.ctc.wstx.maxAttributesPerElement", maxAttributeCount)
-                    && setProperty(factory, "com.ctc.wstx.maxAttributeSize", maxAttributeSize)
-                    && setProperty(factory, "com.ctc.wstx.maxChildrenPerElement", innerElementCountThreshold)
-                    && setProperty(factory, "com.ctc.wstx.maxElementCount", maxElementCount)
-                    && setProperty(factory, "com.ctc.wstx.maxElementDepth", innerElementLevelThreshold)
-                    && setProperty(factory, "com.ctc.wstx.maxCharacters", maxXMLCharacters)
-                    && setProperty(factory, "com.ctc.wstx.maxTextLength", maxTextLength);
+        final boolean wstxMaxs = setProperty(factory, "com.ctc.wstx.maxAttributesPerElement", MAX_ATTR_COUNT_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxAttributeSize", MAX_ATTR_SIZE_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxChildrenPerElement", MAX_CHILD_ELEMENTS_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxElementCount", MAX_ELEMENT_COUNT_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxElementDepth", MAX_ELEMENT_DEPTH_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxCharacters", MAX_XML_CHARS_VAL)
+                    && setProperty(factory, "com.ctc.wstx.maxTextLength", MAX_TEXT_LENGTH_VAL);
         return wstxMaxs
-            && setProperty(factory, "com.ctc.wstx.minTextSegment", minTextSegment);
+            && setProperty(factory, "com.ctc.wstx.minTextSegment", MIN_TEXT_SEGMENT_VAL);
     }
 
     private static boolean setProperty(XMLInputFactory f, String p, Object o) {
@@ -436,13 +441,18 @@ public final class StaxUtils {
     }
 
     public static XMLStreamReader createFilteredReader(XMLStreamReader reader, StreamFilter filter) {
-        XMLInputFactory factory = getXMLInputFactory();
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+
+        XMLInputFactory factory = getXMLInputFactory(loader);
         try {
             return factory.createFilteredReader(reader, filter);
         } catch (XMLStreamException e) {
             throw new RuntimeException("Cant' create XMLStreamReader", e);
         } finally {
-            returnXMLInputFactory(factory);
+            returnXMLInputFactory(factory, loader);
         }
     }
 
@@ -736,15 +746,15 @@ public final class StaxUtils {
                 if (isThreshold) {
                     elementCount++;
 
-                    if (innerElementLevelThreshold != -1
-                        && read >= innerElementLevelThreshold) {
+                    if (MAX_ELEMENT_DEPTH_VAL != -1
+                        && read >= MAX_ELEMENT_DEPTH_VAL) {
                         throw new DepthExceededStaxException("reach the innerElementLevelThreshold:"
-                                                   + innerElementLevelThreshold);
+                                                   + MAX_ELEMENT_DEPTH_VAL);
                     }
-                    if (innerElementCountThreshold != -1
-                        && elementCount >= innerElementCountThreshold) {
+                    if (MAX_CHILD_ELEMENTS_VAL != -1
+                        && elementCount >= MAX_CHILD_ELEMENTS_VAL) {
                         throw new DepthExceededStaxException("reach the innerElementCountThreshold:"
-                                                   + innerElementCountThreshold);
+                                                   + MAX_CHILD_ELEMENTS_VAL);
                     }
                     countStack.push(elementCount);
                     elementCount = 0;
@@ -1304,15 +1314,15 @@ public final class StaxUtils {
                     declare(e, reader.getNamespaceURI(), reader.getPrefix());
                 }
                 stack.push(parent);
-                if (isThreshold && innerElementLevelThreshold != -1
-                    && stack.size() >= innerElementLevelThreshold) {
+                if (isThreshold && MAX_ELEMENT_DEPTH_VAL != -1
+                    && stack.size() >= MAX_ELEMENT_DEPTH_VAL) {
                     throw new DepthExceededStaxException("reach the innerElementLevelThreshold:"
-                                               + innerElementLevelThreshold);
+                                               + MAX_ELEMENT_DEPTH_VAL);
                 }
-                if (isThreshold && innerElementCountThreshold != -1
-                    && elementCount >= innerElementCountThreshold) {
+                if (isThreshold && MAX_CHILD_ELEMENTS_VAL != -1
+                    && elementCount >= MAX_CHILD_ELEMENTS_VAL) {
                     throw new DepthExceededStaxException("reach the innerElementCountThreshold:"
-                                               + innerElementCountThreshold);
+                                               + MAX_CHILD_ELEMENTS_VAL);
                 }
                 parent = e;
                 break;
@@ -1463,15 +1473,15 @@ public final class StaxUtils {
                     declare(e, reader.getNamespaceURI(), reader.getPrefix());
                 }
                 context.pushToStack(parent);
-                if (context.isThreshold() && innerElementLevelThreshold != -1
-                    && context.getStackSize() >= innerElementLevelThreshold) {
+                if (context.isThreshold() && MAX_ELEMENT_DEPTH_VAL != -1
+                    && context.getStackSize() >= MAX_ELEMENT_DEPTH_VAL) {
                     throw new DepthExceededStaxException("reach the innerElementLevelThreshold:"
-                                               + innerElementLevelThreshold);
+                                               + MAX_ELEMENT_DEPTH_VAL);
                 }
-                if (context.isThreshold() && innerElementCountThreshold != -1
-                    && context.getCount() >= innerElementCountThreshold) {
+                if (context.isThreshold() && MAX_CHILD_ELEMENTS_VAL != -1
+                    && context.getCount() >= MAX_CHILD_ELEMENTS_VAL) {
                     throw new DepthExceededStaxException("reach the innerElementCountThreshold:"
-                                               + innerElementCountThreshold);
+                                               + MAX_CHILD_ELEMENTS_VAL);
                 }
                 parent = e;
                 break;
@@ -1545,15 +1555,15 @@ public final class StaxUtils {
                 declare(e, name.getNamespaceURI(), name.getPrefix());
             }
             context.pushToStack(parent);
-            if (context.isThreshold() && innerElementLevelThreshold != -1
-                && context.getStackSize() >= innerElementLevelThreshold) {
+            if (context.isThreshold() && MAX_ELEMENT_DEPTH_VAL != -1
+                && context.getStackSize() >= MAX_ELEMENT_DEPTH_VAL) {
                 throw new DepthExceededStaxException("reach the innerElementLevelThreshold:"
-                                           + innerElementLevelThreshold);
+                                           + MAX_ELEMENT_DEPTH_VAL);
             }
-            if (context.isThreshold() && innerElementCountThreshold != -1
-                && context.getCount() >= innerElementCountThreshold) {
+            if (context.isThreshold() && MAX_CHILD_ELEMENTS_VAL != -1
+                && context.getCount() >= MAX_CHILD_ELEMENTS_VAL) {
                 throw new DepthExceededStaxException("reach the innerElementCountThreshold:"
-                                           + innerElementCountThreshold);
+                                           + MAX_CHILD_ELEMENTS_VAL);
             }
             parent = e;
             break;
@@ -1710,13 +1720,18 @@ public final class StaxUtils {
      * @param encoding
      */
     public static XMLStreamReader createXMLStreamReader(InputStream in, String encoding) {
-        XMLInputFactory factory = getXMLInputFactory();
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+
+        XMLInputFactory factory = getXMLInputFactory(loader);
         try {
             return factory.createXMLStreamReader(in, encoding != null ? encoding : StandardCharsets.UTF_8.name());
         } catch (XMLStreamException e) {
             throw new RuntimeException("Couldn't parse stream.", e);
         } finally {
-            returnXMLInputFactory(factory);
+            returnXMLInputFactory(factory, loader);
         }
     }
 
@@ -1724,23 +1739,33 @@ public final class StaxUtils {
      * @param in
      */
     public static XMLStreamReader createXMLStreamReader(InputStream in) {
-        XMLInputFactory factory = getXMLInputFactory();
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+
+        XMLInputFactory factory = getXMLInputFactory(loader);
         try {
             return factory.createXMLStreamReader(in);
         } catch (XMLStreamException e) {
             throw new RuntimeException("Couldn't parse stream.", e);
         } finally {
-            returnXMLInputFactory(factory);
+            returnXMLInputFactory(factory, loader);
         }
     }
     public static XMLStreamReader createXMLStreamReader(String systemId, InputStream in) {
-        XMLInputFactory factory = getXMLInputFactory();
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+
+        XMLInputFactory factory = getXMLInputFactory(loader);
         try {
             return factory.createXMLStreamReader(systemId, in);
         } catch (XMLStreamException e) {
             throw new RuntimeException("Couldn't parse stream.", e);
         } finally {
-            returnXMLInputFactory(factory);
+            returnXMLInputFactory(factory, loader);
         }
     }
 
@@ -1783,7 +1808,12 @@ public final class StaxUtils {
                 }
             }
 
-            XMLInputFactory factory = getXMLInputFactory();
+            ClassLoader loader = DOMUtils.getContextClassLoader();
+            if (loader == null) {
+                loader = DOMUtils.getClassLoader(StaxUtils.class);
+            }
+
+            XMLInputFactory factory = getXMLInputFactory(loader);
             try {
                 XMLStreamReader reader = null;
 
@@ -1805,7 +1835,7 @@ public final class StaxUtils {
                 }
                 return reader;
             } finally {
-                returnXMLInputFactory(factory);
+                returnXMLInputFactory(factory, loader);
             }
         } catch (XMLStreamException e) {
             throw new RuntimeException("Couldn't parse stream.", e);
@@ -1816,13 +1846,18 @@ public final class StaxUtils {
      * @param reader
      */
     public static XMLStreamReader createXMLStreamReader(Reader reader) {
-        XMLInputFactory factory = getXMLInputFactory();
+        ClassLoader loader = DOMUtils.getContextClassLoader();
+        if (loader == null) {
+            loader = DOMUtils.getClassLoader(StaxUtils.class);
+        }
+
+        XMLInputFactory factory = getXMLInputFactory(loader);
         try {
             return factory.createXMLStreamReader(reader);
         } catch (XMLStreamException e) {
             throw new RuntimeException("Couldn't parse stream.", e);
         } finally {
-            returnXMLInputFactory(factory);
+            returnXMLInputFactory(factory, loader);
         }
     }
 
@@ -2201,14 +2236,14 @@ public final class StaxUtils {
             }
         } catch (ClassCastException cce) {
             //not an XMLStreamReader2
-            if (allowInsecureParser) {
+            if (ALLOW_INSECURE_PARSER_VAL) {
                 LOG.warning("INSTANCE_NOT_XMLSTREAMREADER2");
             } else {
                 throw new XMLStreamException(cce.getMessage(), cce);
             }
         } catch (IllegalArgumentException cce) {
             //not a property supported by this version of woodstox
-            if (allowInsecureParser) {
+            if (ALLOW_INSECURE_PARSER_VAL) {
                 LOG.log(Level.WARNING, "SECURE_PROPERTY_NOT_SUPPORTED", cce.getMessage());
             } else {
                 throw new XMLStreamException(cce.getMessage(), cce);
